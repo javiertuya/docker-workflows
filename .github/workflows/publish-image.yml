@@ -1,0 +1,229 @@
+name: publish-image
+
+# Builds and smoke tests a container image, and publishes it to GHCR (see the README for the details).
+# - Production: on main, publishes the tags main and main-<timestamp> (UTC). Consumers pin main-<timestamp>
+#   (optionally with its @sha256 digest): the timestamp identifies each build and is sortable, so that
+#   update tools can detect the newer versions.
+# - Development: a manual dispatch on another branch publishes the floating tag dev in a separate
+#   package (<image-name>-dev), that is overwritten on each publication and not meant to be pinned.
+#   Refused on the branches that match dev-excluded-branches (e.g. the automated update branches).
+# - Any other run (e.g. a push to another branch) only builds and smoke tests the image.
+# The triggers (branches and paths) belong to the caller.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Name of the package in GHCR (the development package is <image-name>-dev)
+        required: true
+        type: string
+      context:
+        description: Folder with the Dockerfile (build context)
+        required: false
+        type: string
+        default: '.'
+      smoke-test-script:
+        description: Script of the caller repository that tests the image, received in the SMOKE_IMAGE environment variable
+        required: true
+        type: string
+      dev-excluded-branches:
+        description: Branch patterns (separated by spaces) where the development image can't be published
+        required: true
+        type: string
+      image-title:
+        description: OCI title label (default the image name)
+        required: false
+        type: string
+        default: ''
+      image-description:
+        description: OCI description label (default the repository description)
+        required: false
+        type: string
+        default: ''
+      dhi-login:
+        description: Log in to dhi.io before the build (needs the DHI secrets)
+        required: false
+        type: boolean
+        default: false
+      keep-versions:
+        description: Number of production images kept by the cleanup of old versions
+        required: false
+        type: number
+        default: 20
+    secrets:
+      DHI_USERNAME:
+        required: false
+      DHI_TOKEN:
+        required: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}
+  CONTEXT: ${{ inputs.context }}
+  SMOKE_IMAGE: ${{ inputs.image-name }}:smoke
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # Determines what is published from the branch and the event, as outputs for the next steps:
+      # - publish: true if the image is pushed to GHCR (always smoke tested before)
+      # - image and tags: inputs of docker/metadata-action (the timestamp is resolved by the action)
+      # - package, keep-tagged and delete-untagged: inputs of the cleanup of old versions (see the Cleanup step)
+      #
+      # | Branch and event                          | Mode | Package          | Tags                   | Cleanup (after the push)        |
+      # |-------------------------------------------|------|------------------|------------------------|---------------------------------|
+      # | main (any event)                          | main | <image-name>     | main-<timestamp>, main | keep the newest keep-versions   |
+      # | other branch, dispatch                    | dev  | <image-name>-dev | dev                    | delete the untagged images      |
+      # | dev-excluded-branches, dispatch           | -    | -                | fails with an error    | -                               |
+      # | other branch, other event                 | test | (not published)  | -                      | -                               |
+      #
+      # In test mode the image and tags are placeholders: they only set the version label of the smoke test build.
+      - name: Publication mode
+        id: mode
+        env:
+          DEV_EXCLUDED_BRANCHES: ${{ inputs.dev-excluded-branches }}
+          KEEP_VERSIONS: ${{ inputs.keep-versions }}
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            mode=main
+            image="$IMAGE"
+            tags="type=raw,value=main-{{date 'YYYYMMDD.HHmmss' tz='UTC'}},priority=300
+          type=raw,value=main,priority=200"
+            keep_tagged=$KEEP_VERSIONS
+            delete_untagged=
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            set -f # the patterns are not file names
+            for pattern in $DEV_EXCLUDED_BRANCHES; do
+              # shellcheck disable=SC2053 # unquoted to match the pattern
+              if [[ "$GITHUB_REF_NAME" == $pattern ]]; then
+                echo "::error::The development image can't be published from the branch $GITHUB_REF_NAME (matches $pattern)"
+                exit 1
+              fi
+            done
+            set +f
+            mode=dev
+            image="$IMAGE-dev"
+            tags="type=raw,value=dev"
+            keep_tagged=
+            delete_untagged=true
+          else
+            mode=test
+            image="$IMAGE"
+            tags="type=raw,value=test"
+            keep_tagged=
+            delete_untagged=
+          fi
+          echo "Publication mode: $mode, image: $image"
+          { echo "publish=$([ "$mode" = test ] && echo false || echo true)"
+            echo "image=$image"
+            echo "package=${image##*/}"
+            echo "keep-tagged=$keep_tagged"
+            echo "delete-untagged=$delete_untagged"
+            echo "tags<<EOF"; echo "$tags"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v7
+
+      # Labels added to the defaults of docker/metadata-action, whose title and description are the
+      # repository ones, that may describe the repository, not this image
+      - name: Get the image labels
+        id: labels
+        working-directory: ${{ env.CONTEXT }}
+        env:
+          IMAGE_TITLE: ${{ inputs.image-title || inputs.image-name }}
+          IMAGE_DESCRIPTION: ${{ inputs.image-description }}
+        run: |
+          # The runtime base is the last FROM of the Dockerfile, pinned by digest
+          digest=$(grep -E '^FROM ' Dockerfile | tail -n 1 | grep -oE 'sha256:[0-9a-f]{64}' || true)
+          if [ -z "$digest" ]; then
+            echo "::error::The last FROM of the Dockerfile is not pinned by digest"
+            exit 1
+          fi
+          { echo "labels<<EOF"
+            echo "org.opencontainers.image.title=$IMAGE_TITLE"
+            if [ -n "$IMAGE_DESCRIPTION" ]; then echo "org.opencontainers.image.description=$IMAGE_DESCRIPTION"; fi
+            echo "org.opencontainers.image.base.digest=$digest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata (tags and labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.mode.outputs.image }}
+          flavor: latest=false
+          # On main, the timestamp tag has the highest priority, so that it is the image version label
+          tags: ${{ steps.mode.outputs.tags }}
+          labels: ${{ steps.labels.outputs.labels }}
+
+      - name: Login to DHI (base images)
+        if: inputs.dhi-login
+        uses: docker/login-action@v4
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DHI_USERNAME }}
+          password: ${{ secrets.DHI_TOKEN }}
+
+      - name: Login to GHCR
+        if: steps.mode.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The image is built and loaded into the local docker first, to be tested before the push.
+      # The build and push step below reuses the cache of this build, so that it pushes the same image
+      - name: Build for the smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.CONTEXT }}
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.SMOKE_IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+
+      - name: Smoke test
+        env:
+          SMOKE_TEST_SCRIPT: ${{ inputs.smoke-test-script }}
+        run: |
+          if [ ! -f "$SMOKE_TEST_SCRIPT" ]; then
+            echo "::error::Smoke test script not found: $SMOKE_TEST_SCRIPT"
+            exit 1
+          fi
+          bash "$SMOKE_TEST_SCRIPT"
+
+      - name: Build and push
+        if: steps.mode.outputs.publish == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.CONTEXT }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Single amd64 manifest, without index nor attestation manifests (attestations are not needed):
+          # each version listed in GHCR is a single image, without the untagged attestation entries
+          provenance: false
+          sbom: false
+
+      # Removes the old versions of the package just published. Requires the repository to have the admin role
+      # on the package, that it gets when the package is created by this workflow.
+      # - main: keeps the newest keep-versions tagged images (the tags main and main-<timestamp> of a build count as one).
+      #   Consumers may pin an older version by digest: deleting it would break their pulls.
+      #   The default (20) leaves them a wide margin to update, and allows a rollback
+      # - dev: deletes the untagged images, that are the dev builds that were overwritten
+      # Empty inputs are not set (the action ignores them)
+      - name: Cleanup of old versions
+        if: steps.mode.outputs.publish == 'true'
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: ${{ steps.mode.outputs.package }}
+          keep-n-tagged: ${{ steps.mode.outputs.keep-tagged }}
+          delete-untagged: ${{ steps.mode.outputs.delete-untagged }}
