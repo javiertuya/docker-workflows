@@ -222,7 +222,7 @@ jobs:
       # Empty inputs are not set (the action ignores them)
       - name: Cleanup of old versions
         if: steps.mode.outputs.publish == 'true'
-        uses: dataaxiom/ghcr-cleanup-action@v1.2.2
+        uses: dataaxiom/ghcr-cleanup-action@v1.3.0
         with:
           package: ${{ steps.mode.outputs.package }}
           keep-n-tagged: ${{ steps.mode.outputs.keep-tagged }}
